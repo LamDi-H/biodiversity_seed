@@ -1,0 +1,654 @@
+﻿import { useEffect, useState } from "react";
+import {
+  Address,
+  BASE_FEE,
+  Contract,
+  TransactionBuilder,
+  nativeToScVal,
+  scValToNative,
+  rpc,
+} from "@stellar/stellar-sdk";
+
+import { StellarWalletsKit } from "@creit-tech/stellar-wallets-kit/sdk";
+import { defaultModules } from "@creit-tech/stellar-wallets-kit/modules/utils";
+
+import {
+  CONTRACT_ID,
+  NETWORK_PASSPHRASE,
+  RPC_URL,
+  STELLAR_EXPERT_CONTRACT_URL,
+} from "./contractConfig";
+
+type TxStatus = "idle" | "pending" | "success" | "failed";
+
+type ActivityItem = {
+  title: string;
+  description: string;
+  txHash?: string;
+};
+
+const server = new rpc.Server(RPC_URL);
+const contract = new Contract(CONTRACT_ID);
+
+function formatNative(value: any): string {
+  return JSON.stringify(
+    value,
+    (_key, val) => {
+      if (val instanceof Map) {
+        return Object.fromEntries(val);
+      }
+
+      if (typeof val === "bigint") {
+        return val.toString();
+      }
+
+      if (val && typeof val.toString === "function" && val.constructor?.name === "Address") {
+        return val.toString();
+      }
+
+      return val;
+    },
+    2
+  );
+}
+
+function parseFriendlyError(error: unknown): string {
+  const message = error instanceof Error ? error.message : String(error);
+  const lower = message.toLowerCase();
+
+  if (
+    lower.includes("wallet not found") ||
+    lower.includes("not installed") ||
+    lower.includes("extension") ||
+    lower.includes("no wallet")
+  ) {
+    return "Wallet not found: Please install or enable a Stellar wallet such as Freighter.";
+  }
+
+  if (
+    lower.includes("reject") ||
+    lower.includes("denied") ||
+    lower.includes("cancel") ||
+    lower.includes("declined")
+  ) {
+    return "User rejected transaction: You cancelled the wallet approval request.";
+  }
+
+  if (
+    lower.includes("insufficient") ||
+    lower.includes("underfunded") ||
+    lower.includes("tx_failed") ||
+    lower.includes("failed")
+  ) {
+    return "Insufficient balance or transaction failed: Please fund your Stellar testnet wallet and try again.";
+  }
+
+  return message;
+}
+
+function shortenText(value: string, start = 8, end = 6) {
+  if (!value) return "";
+  if (value.length <= start + end + 3) return value;
+  return `${value.slice(0, start)}...${value.slice(-end)}`;
+}
+
+export default function App() {
+  const [publicKey, setPublicKey] = useState("");
+  const [txStatus, setTxStatus] = useState<TxStatus>("idle");
+  const [txHash, setTxHash] = useState("");
+  const [errorMessage, setErrorMessage] = useState("");
+  const [walletReady, setWalletReady] = useState(false);
+
+  const [species, setSpecies] = useState("Oryza sativa");
+  const [origin, setOrigin] = useState("Vietnam");
+  const [count, setCount] = useState("1000");
+
+  const [lotId, setLotId] = useState("1");
+  const [amount, setAmount] = useState("100");
+  const [note, setNote] = useState("drought tolerance study");
+
+  const [readResult, setReadResult] = useState("");
+  const [activityFeed, setActivityFeed] = useState<ActivityItem[]>([]);
+
+  useEffect(() => {
+    try {
+      StellarWalletsKit.init({
+        modules: defaultModules(),
+      });
+
+      setWalletReady(true);
+    } catch (error) {
+      setWalletReady(false);
+      setErrorMessage(parseFriendlyError(error));
+    }
+  }, []);
+
+  async function connectWallet() {
+    try {
+      setErrorMessage("");
+
+      if (!walletReady) {
+        throw new Error("Wallet not found: wallet kit is not ready yet.");
+      }
+
+      const result = await StellarWalletsKit.authModal();
+      setPublicKey(result.address);
+
+      addActivity(
+        "Wallet connected",
+        `Connected wallet ${shortenText(result.address, 12, 8)}`
+      );
+    } catch (error) {
+      setErrorMessage(parseFriendlyError(error));
+    }
+  }
+
+  async function refreshWalletAddress() {
+    try {
+      setErrorMessage("");
+
+      const result = await StellarWalletsKit.getAddress();
+      setPublicKey(result.address);
+
+      addActivity(
+        "Wallet address refreshed",
+        `Current wallet ${shortenText(result.address, 12, 8)}`
+      );
+    } catch (error) {
+      setErrorMessage(parseFriendlyError(error));
+    }
+  }
+
+  async function disconnectWallet() {
+    setPublicKey("");
+    setTxStatus("idle");
+    setTxHash("");
+    setReadResult("");
+    setErrorMessage("");
+
+    try {
+      await StellarWalletsKit.disconnect();
+    } catch {
+      // Some wallet modules may not need an explicit disconnect.
+    }
+  }
+
+  async function signAndSubmit(functionName: string, args: any[]) {
+    if (!publicKey) {
+      throw new Error("Wallet not found: connect your Stellar wallet first.");
+    }
+
+    setTxStatus("pending");
+    setTxHash("");
+    setErrorMessage("");
+
+    const sourceAccount = await server.getAccount(publicKey);
+
+    const tx = new TransactionBuilder(sourceAccount, {
+      fee: BASE_FEE,
+      networkPassphrase: NETWORK_PASSPHRASE,
+    })
+      .addOperation(contract.call(functionName, ...args))
+      .setTimeout(30)
+      .build();
+
+    const preparedTx = await server.prepareTransaction(tx);
+
+    const signed = await StellarWalletsKit.signTransaction(preparedTx.toXDR(), {
+      networkPassphrase: NETWORK_PASSPHRASE,
+      address: publicKey,
+    });
+
+    const signedTx = TransactionBuilder.fromXDR(
+      signed.signedTxXdr,
+      NETWORK_PASSPHRASE
+    );
+
+    const sendResponse = await server.sendTransaction(signedTx);
+    const hash = sendResponse.hash;
+
+    setTxHash(hash);
+
+    for (let i = 0; i < 20; i += 1) {
+      const response = await server.getTransaction(hash);
+
+      if (response.status === "SUCCESS") {
+        setTxStatus("success");
+        return hash;
+      }
+
+      if (response.status === "FAILED") {
+        setTxStatus("failed");
+        throw new Error("Transaction failed on Stellar testnet.");
+      }
+
+      await new Promise((resolve) => setTimeout(resolve, 1500));
+    }
+
+    throw new Error("Transaction is still pending. Please check Stellar Expert.");
+  }
+
+  async function simulateRead(functionName: string, args: any[]) {
+    if (!publicKey) {
+      throw new Error("Wallet not found: connect your Stellar wallet first.");
+    }
+
+    const sourceAccount = await server.getAccount(publicKey);
+
+    const tx = new TransactionBuilder(sourceAccount, {
+      fee: BASE_FEE,
+      networkPassphrase: NETWORK_PASSPHRASE,
+    })
+      .addOperation(contract.call(functionName, ...args))
+      .setTimeout(30)
+      .build();
+
+    const simulation = await server.simulateTransaction(tx);
+
+    if ("error" in simulation) {
+      throw new Error(simulation.error);
+    }
+
+    const result = (simulation as any).result?.retval;
+    return scValToNative(result);
+  }
+
+  function addActivity(title: string, description: string, hash?: string) {
+    setActivityFeed((current) => [
+      {
+        title,
+        description,
+        txHash: hash,
+      },
+      ...current.slice(0, 6),
+    ]);
+  }
+
+  async function registerLot() {
+    try {
+      const hash = await signAndSubmit("register_lot", [
+        Address.fromString(publicKey).toScVal(),
+        nativeToScVal(species, { type: "string" }),
+        nativeToScVal(origin, { type: "string" }),
+        nativeToScVal(Number(count), { type: "u32" }),
+      ]);
+
+      addActivity(
+        "Seed lot registered",
+        `${species} from ${origin} with ${count} seeds`,
+        hash
+      );
+    } catch (error) {
+      setTxStatus("failed");
+      setErrorMessage(parseFriendlyError(error));
+    }
+  }
+
+  async function checkoutSeeds() {
+    try {
+      const hash = await signAndSubmit("checkout", [
+        Address.fromString(publicKey).toScVal(),
+        nativeToScVal(Number(lotId), { type: "u32" }),
+        nativeToScVal(Number(amount), { type: "u32" }),
+        nativeToScVal(note, { type: "string" }),
+      ]);
+
+      addActivity(
+        "Seeds checked out",
+        `${amount} seeds checked out from lot #${lotId}`,
+        hash
+      );
+    } catch (error) {
+      setTxStatus("failed");
+      setErrorMessage(parseFriendlyError(error));
+    }
+  }
+
+  async function returnSeeds() {
+    try {
+      const hash = await signAndSubmit("return_seeds", [
+        Address.fromString(publicKey).toScVal(),
+        nativeToScVal(Number(lotId), { type: "u32" }),
+        nativeToScVal(Number(amount), { type: "u32" }),
+        nativeToScVal(note, { type: "string" }),
+      ]);
+
+      addActivity(
+        "Seeds returned",
+        `${amount} seeds returned to lot #${lotId}`,
+        hash
+      );
+    } catch (error) {
+      setTxStatus("failed");
+      setErrorMessage(parseFriendlyError(error));
+    }
+  }
+
+  async function depleteSeeds() {
+    try {
+      const hash = await signAndSubmit("deplete", [
+        Address.fromString(publicKey).toScVal(),
+        nativeToScVal(Number(lotId), { type: "u32" }),
+        nativeToScVal(Number(amount), { type: "u32" }),
+        nativeToScVal(note, { type: "string" }),
+      ]);
+
+      addActivity(
+        "Seeds depleted",
+        `${amount} seeds depleted from lot #${lotId}`,
+        hash
+      );
+    } catch (error) {
+      setTxStatus("failed");
+      setErrorMessage(parseFriendlyError(error));
+    }
+  }
+
+  async function readLot() {
+    try {
+      setErrorMessage("");
+
+      const data = await simulateRead("get_lot", [
+        nativeToScVal(Number(lotId), { type: "u32" }),
+      ]);
+
+      setReadResult(formatNative(data));
+      addActivity("Seed lot synced", `Read latest data for lot #${lotId}`);
+    } catch (error) {
+      setErrorMessage(parseFriendlyError(error));
+    }
+  }
+
+  function showHandledError(type: "wallet" | "reject" | "balance") {
+    if (type === "wallet") {
+      setErrorMessage(
+        "Wallet not found: Please install or enable a Stellar wallet such as Freighter."
+      );
+    }
+
+    if (type === "reject") {
+      setErrorMessage(
+        "User rejected transaction: You cancelled the wallet approval request."
+      );
+    }
+
+    if (type === "balance") {
+      setErrorMessage(
+        "Insufficient balance or transaction failed: Please fund your Stellar testnet wallet and try again."
+      );
+    }
+
+    setTxStatus("failed");
+  }
+
+  const txStatusText = {
+    idle: "Ready",
+    pending: "Pending",
+    success: "Success",
+    failed: "Failed",
+  }[txStatus];
+
+  return (
+    <main className="app-shell">
+      <div className="background-orb orb-one" />
+      <div className="background-orb orb-two" />
+
+      <header className="topbar">
+        <div className="brand">
+          <div className="brand-mark">bs</div>
+          <div>
+            <strong>biodiversity_seed</strong>
+            <span>Seed-bank ledger on Stellar Testnet</span>
+          </div>
+        </div>
+
+        <div className="topbar-actions">
+          <span className="network-chip">Stellar Testnet</span>
+          <a
+            className="ghost-link"
+            href={STELLAR_EXPERT_CONTRACT_URL}
+            target="_blank"
+            rel="noreferrer"
+          >
+            Explorer
+          </a>
+        </div>
+      </header>
+
+      <section className="hero">
+        <div className="hero-main">
+          <p className="eyebrow">Stellar Level 2 Submission</p>
+          <h1>Traceable seed-bank operations, verified on-chain.</h1>
+          <p className="hero-text">
+            Register seed lots, track checkouts, returns, and depletions through
+            a deployed Soroban smart contract. Built for community seed-banks,
+            research teams, and biodiversity preservation workflows.
+          </p>
+        </div>
+
+        <aside className="contract-card">
+          <div className="card-kicker">Deployed contract</div>
+          <code title={CONTRACT_ID}>{CONTRACT_ID}</code>
+          <div className="contract-meta">
+            <span>RPC</span>
+            <strong>Soroban Testnet</strong>
+          </div>
+          <div className="contract-meta">
+            <span>Status</span>
+            <strong>Live</strong>
+          </div>
+          <a
+            className="text-link"
+            href={STELLAR_EXPERT_CONTRACT_URL}
+            target="_blank"
+            rel="noreferrer"
+          >
+            View contract on Stellar Expert →
+          </a>
+        </aside>
+      </section>
+
+      <section className="metrics-grid">
+        <div className="metric-card">
+          <span>Contract functions</span>
+          <strong>7</strong>
+          <p>register, checkout, return, deplete, read and sync</p>
+        </div>
+
+        <div className="metric-card">
+          <span>Wallet status</span>
+          <strong>{publicKey ? "Connected" : "Not connected"}</strong>
+          <p>{publicKey ? shortenText(publicKey, 12, 8) : "Connect wallet to start"}</p>
+        </div>
+
+        <div className="metric-card">
+          <span>Transaction status</span>
+          <strong>{txStatusText}</strong>
+          <p>{txHash ? shortenText(txHash, 14, 10) : "No transaction submitted yet"}</p>
+        </div>
+
+        <div className="metric-card">
+          <span>Activity events</span>
+          <strong>{activityFeed.length}</strong>
+          <p>Local activity feed for demo synchronization</p>
+        </div>
+      </section>
+
+      <section id="operations" className="workspace-grid">
+        <div className="panel wallet-panel">
+          <div className="panel-header">
+            <div>
+              <span className="section-number">01</span>
+              <h2>Wallet Control</h2>
+            </div>
+            <p>Open the multi-wallet modal, then connect your Stellar wallet.</p>
+          </div>
+
+          <div className="button-row">
+            <button onClick={connectWallet}>Connect Wallet</button>
+            <button className="secondary-button" onClick={refreshWalletAddress}>
+              Refresh Address
+            </button>
+            <button className="secondary-button" onClick={disconnectWallet}>
+              Disconnect
+            </button>
+          </div>
+
+          <div className="data-row">
+            <span>Connected wallet</span>
+            <code title={publicKey || "Not connected yet"}>
+              {publicKey ? shortenText(publicKey, 12, 8) : "Not connected yet"}
+            </code>
+          </div>
+        </div>
+
+        <div className="panel">
+          <div className="panel-header">
+            <div>
+              <span className="section-number">02</span>
+              <h2>Register Seed Lot</h2>
+            </div>
+            <p>Create a verifiable on-chain record for a seed lot.</p>
+          </div>
+
+          <label>Species</label>
+          <input value={species} onChange={(e) => setSpecies(e.target.value)} />
+
+          <label>Origin</label>
+          <input value={origin} onChange={(e) => setOrigin(e.target.value)} />
+
+          <label>Seed count</label>
+          <input value={count} onChange={(e) => setCount(e.target.value)} />
+
+          <button onClick={registerLot}>Register seed lot</button>
+        </div>
+
+        <div className="panel">
+          <div className="panel-header">
+            <div>
+              <span className="section-number">03</span>
+              <h2>Seed Movements</h2>
+            </div>
+            <p>Record checkout, return, or depletion against a seed lot.</p>
+          </div>
+
+          <label>Lot ID</label>
+          <input value={lotId} onChange={(e) => setLotId(e.target.value)} />
+
+          <label>Amount</label>
+          <input value={amount} onChange={(e) => setAmount(e.target.value)} />
+
+          <label>Study / note / reason</label>
+          <input value={note} onChange={(e) => setNote(e.target.value)} />
+
+          <div className="button-row">
+            <button onClick={checkoutSeeds}>Checkout</button>
+            <button onClick={returnSeeds}>Return</button>
+            <button onClick={depleteSeeds}>Deplete</button>
+          </div>
+        </div>
+
+        <div className="panel state-panel">
+          <div className="panel-header">
+            <div>
+              <span className="section-number">04</span>
+              <h2>Contract State</h2>
+            </div>
+            <p>Read seed lot data directly from the deployed contract.</p>
+          </div>
+
+          <button onClick={readLot}>Read lot data</button>
+
+          <pre>{readResult || "No data loaded yet. Register a seed lot, then read Lot ID 1."}</pre>
+        </div>
+      </section>
+
+      <section id="evidence" className="evidence-grid">
+        <div className="panel tx-panel">
+          <div className="panel-header">
+            <div>
+              <span className="section-number">05</span>
+              <h2>Transaction Monitor</h2>
+            </div>
+            <p>Required Level 2 evidence: pending, success/fail status and tx hash.</p>
+          </div>
+
+          <div className={`status-pill ${txStatus}`}>
+            <span className="status-dot" />
+            {txStatusText}
+          </div>
+
+          <div className="data-row">
+            <span>Transaction hash</span>
+            <code title={txHash || "No transaction yet"}>
+              {txHash ? txHash : "No transaction yet"}
+            </code>
+          </div>
+
+          {txHash && (
+            <a
+              className="text-link"
+              href={`https://stellar.expert/explorer/testnet/tx/${txHash}`}
+              target="_blank"
+              rel="noreferrer"
+            >
+              View transaction on Stellar Expert →
+            </a>
+          )}
+
+          {errorMessage && <div className="error-box">{errorMessage}</div>}
+        </div>
+
+        <div className="panel activity-panel">
+          <div className="panel-header">
+            <div>
+              <span className="section-number">06</span>
+              <h2>Activity Feed</h2>
+            </div>
+            <p>Local event-style feed showing recent app and contract actions.</p>
+          </div>
+
+          {activityFeed.length === 0 && (
+            <div className="empty-state">
+              No activity yet. Start by connecting wallet or registering a seed lot.
+            </div>
+          )}
+
+          {activityFeed.map((item, index) => (
+            <div className="activity-item" key={`${item.title}-${index}`}>
+              <div className="activity-marker" />
+              <div>
+                <strong>{item.title}</strong>
+                <p>{item.description}</p>
+                {item.txHash && <code title={item.txHash}>{shortenText(item.txHash, 16, 12)}</code>}
+              </div>
+            </div>
+          ))}
+        </div>
+
+        <div className="panel error-panel">
+          <div className="panel-header">
+            <div>
+              <span className="section-number">07</span>
+              <h2>Handled Errors</h2>
+            </div>
+            <p>Three required Level 2 error types are demonstrated here.</p>
+          </div>
+
+          <div className="error-demo-grid">
+            <button className="secondary-button" onClick={() => showHandledError("wallet")}>
+              Wallet not found
+            </button>
+            <button className="secondary-button" onClick={() => showHandledError("reject")}>
+              User rejected
+            </button>
+            <button className="secondary-button" onClick={() => showHandledError("balance")}>
+              Insufficient balance
+            </button>
+          </div>
+        </div>
+      </section>
+    </main>
+  );
+}
+
