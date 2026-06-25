@@ -8,7 +8,7 @@ The application helps seed banks, research labs, conservation NGOs, and communit
 
 ## Problem
 
-Seed banks and conservation programs often manage seed accessions, custody transfers, viability results, and distribution records across spreadsheets or isolated internal systems.
+Seed banks and conservation programs often manage seed accessions, custody transfers, viability results, and distribution records across spreadsheets or siloed private systems.
 
 This creates problems such as weak traceability, unclear custody history, hard-to-verify seed sample movement, limited transparency, and difficult reporting for biodiversity programs.
 
