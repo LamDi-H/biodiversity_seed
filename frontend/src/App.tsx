@@ -1,654 +1,562 @@
-﻿import { useEffect, useState } from "react";
+﻿import { useMemo, useState } from "react";
+import { CONTRACT_CONFIG } from "./contractConfig";
 import {
-  Address,
-  BASE_FEE,
-  Contract,
-  TransactionBuilder,
-  nativeToScVal,
-  scValToNative,
-  rpc,
-} from "@stellar/stellar-sdk";
-
-import { StellarWalletsKit } from "@creit-tech/stellar-wallets-kit/sdk";
-import { defaultModules } from "@creit-tech/stellar-wallets-kit/modules/utils";
-
+  CONTRACT_FUNCTIONS,
+  MOCK_SEED_LOTS,
+  getContractExplorerUrl,
+  simulateContractAction,
+  type ContractFunctionName
+} from "./services/contract";
 import {
-  CONTRACT_ID,
-  NETWORK_PASSPHRASE,
-  RPC_URL,
-  STELLAR_EXPERT_CONTRACT_URL,
-} from "./contractConfig";
+  fetchRecentInteractions,
+  fetchRegistryStats,
+  submitFeedback,
+  type FeedbackRecord,
+  type InteractionRecord
+} from "./services/api";
+import { getAnalyticsEvents, getAnalyticsSummary, trackEvent } from "./services/analytics";
 
-type TxStatus = "idle" | "pending" | "success" | "failed";
+declare global {
+  interface Window {
+    freighterApi?: {
+      isConnected?: () => Promise<boolean>;
+      getPublicKey?: () => Promise<string>;
+    };
+  }
+}
 
-type ActivityItem = {
-  title: string;
-  description: string;
+type WalletState = {
+  connected: boolean;
+  publicKey: string;
+};
+
+type UiStatus = {
+  type: "idle" | "loading" | "success" | "error";
+  message: string;
   txHash?: string;
 };
 
-const server = new rpc.Server(RPC_URL);
-const contract = new Contract(CONTRACT_ID);
+const initialWallet: WalletState = {
+  connected: false,
+  publicKey: ""
+};
 
-function formatNative(value: any): string {
-  return JSON.stringify(
-    value,
-    (_key, val) => {
-      if (val instanceof Map) {
-        return Object.fromEntries(val);
-      }
+function shortenAddress(value: string) {
+  if (!value) {
+    return "Not connected";
+  }
 
-      if (typeof val === "bigint") {
-        return val.toString();
-      }
+  if (value.length < 12) {
+    return value;
+  }
 
-      if (val && typeof val.toString === "function" && val.constructor?.name === "Address") {
-        return val.toString();
-      }
+  return `${value.slice(0, 6)}...${value.slice(-6)}`;
+}
 
-      return val;
-    },
-    2
+function App() {
+  const [wallet, setWallet] = useState<WalletState>(initialWallet);
+  const [status, setStatus] = useState<UiStatus>({
+    type: "idle",
+    message: "Ready to connect wallet and run Seed Passport actions."
+  });
+  const [selectedAction, setSelectedAction] =
+    useState<ContractFunctionName>("create_seed_lot");
+  const [interactions, setInteractions] = useState<InteractionRecord[]>([]);
+  const [feedback, setFeedback] = useState<FeedbackRecord[]>([]);
+  const [feedbackComment, setFeedbackComment] = useState("");
+  const [feedbackRole, setFeedbackRole] = useState("Seed bank operator");
+  const [feedbackScore, setFeedbackScore] = useState(5);
+  const [stats, setStats] = useState({
+    totalLots: 18,
+    activeLots: 14,
+    distributedLots: 2,
+    riskLots: 2,
+    totalSamples: 12840,
+    availableSamples: 9310,
+    custodyRecords: 57
+  });
+
+  const writeFunctions = useMemo(
+    () => CONTRACT_FUNCTIONS.filter((item) => item.type === "write"),
+    []
   );
-}
 
-function parseFriendlyError(error: unknown): string {
-  const message = error instanceof Error ? error.message : String(error);
-  const lower = message.toLowerCase();
+  const readFunctions = useMemo(
+    () => CONTRACT_FUNCTIONS.filter((item) => item.type === "read"),
+    []
+  );
 
-  if (
-    lower.includes("wallet not found") ||
-    lower.includes("not installed") ||
-    lower.includes("extension") ||
-    lower.includes("no wallet")
-  ) {
-    return "Wallet not found: Please install or enable a Stellar wallet such as Freighter.";
-  }
-
-  if (
-    lower.includes("reject") ||
-    lower.includes("denied") ||
-    lower.includes("cancel") ||
-    lower.includes("declined")
-  ) {
-    return "User rejected transaction: You cancelled the wallet approval request.";
-  }
-
-  if (
-    lower.includes("insufficient") ||
-    lower.includes("underfunded") ||
-    lower.includes("tx_failed") ||
-    lower.includes("failed")
-  ) {
-    return "Insufficient balance or transaction failed: Please fund your Stellar testnet wallet and try again.";
-  }
-
-  return message;
-}
-
-function shortenText(value: string, start = 8, end = 6) {
-  if (!value) return "";
-  if (value.length <= start + end + 3) return value;
-  return `${value.slice(0, start)}...${value.slice(-end)}`;
-}
-
-export default function App() {
-  const [publicKey, setPublicKey] = useState("");
-  const [txStatus, setTxStatus] = useState<TxStatus>("idle");
-  const [txHash, setTxHash] = useState("");
-  const [errorMessage, setErrorMessage] = useState("");
-  const [walletReady, setWalletReady] = useState(false);
-
-  const [species, setSpecies] = useState("Oryza sativa");
-  const [origin, setOrigin] = useState("Vietnam");
-  const [count, setCount] = useState("1000");
-
-  const [lotId, setLotId] = useState("1");
-  const [amount, setAmount] = useState("100");
-  const [note, setNote] = useState("drought tolerance study");
-
-  const [readResult, setReadResult] = useState("");
-  const [activityFeed, setActivityFeed] = useState<ActivityItem[]>([]);
-
-  useEffect(() => {
-    try {
-      StellarWalletsKit.init({
-        modules: defaultModules(),
-      });
-
-      setWalletReady(true);
-    } catch (error) {
-      setWalletReady(false);
-      setErrorMessage(parseFriendlyError(error));
-    }
-  }, []);
+  const analyticsSummary = getAnalyticsSummary();
+  const analyticsEvents = getAnalyticsEvents();
 
   async function connectWallet() {
-    try {
-      setErrorMessage("");
-
-      if (!walletReady) {
-        throw new Error("Wallet not found: wallet kit is not ready yet.");
-      }
-
-      const result = await StellarWalletsKit.authModal();
-      setPublicKey(result.address);
-
-      addActivity(
-        "Wallet connected",
-        `Connected wallet ${shortenText(result.address, 12, 8)}`
-      );
-    } catch (error) {
-      setErrorMessage(parseFriendlyError(error));
-    }
-  }
-
-  async function refreshWalletAddress() {
-    try {
-      setErrorMessage("");
-
-      const result = await StellarWalletsKit.getAddress();
-      setPublicKey(result.address);
-
-      addActivity(
-        "Wallet address refreshed",
-        `Current wallet ${shortenText(result.address, 12, 8)}`
-      );
-    } catch (error) {
-      setErrorMessage(parseFriendlyError(error));
-    }
-  }
-
-  async function disconnectWallet() {
-    setPublicKey("");
-    setTxStatus("idle");
-    setTxHash("");
-    setReadResult("");
-    setErrorMessage("");
-
-    try {
-      await StellarWalletsKit.disconnect();
-    } catch {
-      // Some wallet modules may not need an explicit disconnect.
-    }
-  }
-
-  async function signAndSubmit(functionName: string, args: any[]) {
-    if (!publicKey) {
-      throw new Error("Wallet not found: connect your Stellar wallet first.");
-    }
-
-    setTxStatus("pending");
-    setTxHash("");
-    setErrorMessage("");
-
-    const sourceAccount = await server.getAccount(publicKey);
-
-    const tx = new TransactionBuilder(sourceAccount, {
-      fee: BASE_FEE,
-      networkPassphrase: NETWORK_PASSPHRASE,
-    })
-      .addOperation(contract.call(functionName, ...args))
-      .setTimeout(30)
-      .build();
-
-    const preparedTx = await server.prepareTransaction(tx);
-
-    const signed = await StellarWalletsKit.signTransaction(preparedTx.toXDR(), {
-      networkPassphrase: NETWORK_PASSPHRASE,
-      address: publicKey,
+    setStatus({
+      type: "loading",
+      message: "Checking Freighter wallet connection..."
     });
 
-    const signedTx = TransactionBuilder.fromXDR(
-      signed.signedTxXdr,
-      NETWORK_PASSPHRASE
-    );
-
-    const sendResponse = await server.sendTransaction(signedTx);
-    const hash = sendResponse.hash;
-
-    setTxHash(hash);
-
-    for (let i = 0; i < 20; i += 1) {
-      const response = await server.getTransaction(hash);
-
-      if (response.status === "SUCCESS") {
-        setTxStatus("success");
-        return hash;
+    try {
+      if (!window.freighterApi) {
+        setStatus({
+          type: "error",
+          message:
+            "Wallet not found. Install Freighter or open this app in a browser with Freighter enabled."
+        });
+        trackEvent("wallet_not_found", { network: CONTRACT_CONFIG.network });
+        return;
       }
 
-      if (response.status === "FAILED") {
-        setTxStatus("failed");
-        throw new Error("Transaction failed on Stellar testnet.");
+      const isConnected = await window.freighterApi.isConnected?.();
+
+      if (!isConnected) {
+        setStatus({
+          type: "error",
+          message:
+            "Wallet is not connected yet. Open Freighter and approve this app."
+        });
+        trackEvent("wallet_not_connected", { network: CONTRACT_CONFIG.network });
+        return;
       }
 
-      await new Promise((resolve) => setTimeout(resolve, 1500));
-    }
+      const publicKey = (await window.freighterApi.getPublicKey?.()) ?? "";
 
-    throw new Error("Transaction is still pending. Please check Stellar Expert.");
+      setWallet({
+        connected: Boolean(publicKey),
+        publicKey
+      });
+
+      setStatus({
+        type: "success",
+        message: "Wallet connected successfully."
+      });
+
+      trackEvent("wallet_connected", {
+        network: CONTRACT_CONFIG.network,
+        hasPublicKey: Boolean(publicKey)
+      });
+    } catch {
+      setStatus({
+        type: "error",
+        message: "User rejected wallet connection or wallet request failed."
+      });
+      trackEvent("wallet_connection_failed", { network: CONTRACT_CONFIG.network });
+    }
   }
 
-  async function simulateRead(functionName: string, args: any[]) {
-    if (!publicKey) {
-      throw new Error("Wallet not found: connect your Stellar wallet first.");
-    }
-
-    const sourceAccount = await server.getAccount(publicKey);
-
-    const tx = new TransactionBuilder(sourceAccount, {
-      fee: BASE_FEE,
-      networkPassphrase: NETWORK_PASSPHRASE,
-    })
-      .addOperation(contract.call(functionName, ...args))
-      .setTimeout(30)
-      .build();
-
-    const simulation = await server.simulateTransaction(tx);
-
-    if ("error" in simulation) {
-      throw new Error(simulation.error);
-    }
-
-    const result = (simulation as any).result?.retval;
-    return scValToNative(result);
+  function disconnectWallet() {
+    setWallet(initialWallet);
+    setStatus({
+      type: "idle",
+      message: "Wallet disconnected."
+    });
+    trackEvent("wallet_disconnected", {});
   }
 
-  function addActivity(title: string, description: string, hash?: string) {
-    setActivityFeed((current) => [
-      {
-        title,
-        description,
-        txHash: hash,
-      },
-      ...current.slice(0, 6),
+  async function refreshProductData() {
+    setStatus({
+      type: "loading",
+      message: "Refreshing registry stats and wallet interaction data..."
+    });
+
+    const [nextStats, nextInteractions] = await Promise.all([
+      fetchRegistryStats(),
+      fetchRecentInteractions()
     ]);
+
+    setStats(nextStats);
+    setInteractions(nextInteractions);
+
+    setStatus({
+      type: "success",
+      message: "Product data refreshed."
+    });
+
+    trackEvent("dashboard_data_refreshed", {
+      interactions: nextInteractions.length,
+      totalLots: nextStats.totalLots
+    });
   }
 
-  async function registerLot() {
+  async function runAction() {
+    if (!wallet.connected) {
+      setStatus({
+        type: "error",
+        message: "Connect wallet before running a contract action."
+      });
+      trackEvent("contract_action_blocked", {
+        reason: "wallet_not_connected",
+        action: selectedAction
+      });
+      return;
+    }
+
+    setStatus({
+      type: "loading",
+      message: `Preparing ${selectedAction} transaction...`
+    });
+
     try {
-      const hash = await signAndSubmit("register_lot", [
-        Address.fromString(publicKey).toScVal(),
-        nativeToScVal(species, { type: "string" }),
-        nativeToScVal(origin, { type: "string" }),
-        nativeToScVal(Number(count), { type: "u32" }),
+      const result = await simulateContractAction(selectedAction);
+
+      setStatus({
+        type: "success",
+        message: result.message,
+        txHash: result.txHash
+      });
+
+      setInteractions((current) => [
+        {
+          id: result.txHash,
+          wallet: shortenAddress(wallet.publicKey),
+          action: result.functionName,
+          status: "success",
+          timestamp: "just now",
+          txHash: result.txHash
+        },
+        ...current
       ]);
 
-      addActivity(
-        "Seed lot registered",
-        `${species} from ${origin} with ${count} seeds`,
-        hash
-      );
-    } catch (error) {
-      setTxStatus("failed");
-      setErrorMessage(parseFriendlyError(error));
+      trackEvent("contract_action_success", {
+        action: selectedAction,
+        network: CONTRACT_CONFIG.network
+      });
+    } catch {
+      setStatus({
+        type: "error",
+        message:
+          "Transaction failed. Check wallet balance, network, and contract config."
+      });
+      trackEvent("contract_action_failed", {
+        action: selectedAction,
+        network: CONTRACT_CONFIG.network
+      });
     }
   }
 
-  async function checkoutSeeds() {
-    try {
-      const hash = await signAndSubmit("checkout", [
-        Address.fromString(publicKey).toScVal(),
-        nativeToScVal(Number(lotId), { type: "u32" }),
-        nativeToScVal(Number(amount), { type: "u32" }),
-        nativeToScVal(note, { type: "string" }),
-      ]);
-
-      addActivity(
-        "Seeds checked out",
-        `${amount} seeds checked out from lot #${lotId}`,
-        hash
-      );
-    } catch (error) {
-      setTxStatus("failed");
-      setErrorMessage(parseFriendlyError(error));
+  async function sendFeedback() {
+    if (!feedbackComment.trim()) {
+      setStatus({
+        type: "error",
+        message: "Please enter user feedback before submitting."
+      });
+      return;
     }
+
+    const record = await submitFeedback({
+      role: feedbackRole,
+      score: feedbackScore,
+      comment: feedbackComment.trim()
+    });
+
+    setFeedback((current) => [record, ...current]);
+    setFeedbackComment("");
+
+    setStatus({
+      type: "success",
+      message: "Feedback saved for Level 4 product validation summary."
+    });
+
+    trackEvent("feedback_submitted", {
+      role: feedbackRole,
+      score: feedbackScore
+    });
   }
-
-  async function returnSeeds() {
-    try {
-      const hash = await signAndSubmit("return_seeds", [
-        Address.fromString(publicKey).toScVal(),
-        nativeToScVal(Number(lotId), { type: "u32" }),
-        nativeToScVal(Number(amount), { type: "u32" }),
-        nativeToScVal(note, { type: "string" }),
-      ]);
-
-      addActivity(
-        "Seeds returned",
-        `${amount} seeds returned to lot #${lotId}`,
-        hash
-      );
-    } catch (error) {
-      setTxStatus("failed");
-      setErrorMessage(parseFriendlyError(error));
-    }
-  }
-
-  async function depleteSeeds() {
-    try {
-      const hash = await signAndSubmit("deplete", [
-        Address.fromString(publicKey).toScVal(),
-        nativeToScVal(Number(lotId), { type: "u32" }),
-        nativeToScVal(Number(amount), { type: "u32" }),
-        nativeToScVal(note, { type: "string" }),
-      ]);
-
-      addActivity(
-        "Seeds depleted",
-        `${amount} seeds depleted from lot #${lotId}`,
-        hash
-      );
-    } catch (error) {
-      setTxStatus("failed");
-      setErrorMessage(parseFriendlyError(error));
-    }
-  }
-
-  async function readLot() {
-    try {
-      setErrorMessage("");
-
-      const data = await simulateRead("get_lot", [
-        nativeToScVal(Number(lotId), { type: "u32" }),
-      ]);
-
-      setReadResult(formatNative(data));
-      addActivity("Seed lot synced", `Read latest data for lot #${lotId}`);
-    } catch (error) {
-      setErrorMessage(parseFriendlyError(error));
-    }
-  }
-
-  function showHandledError(type: "wallet" | "reject" | "balance") {
-    if (type === "wallet") {
-      setErrorMessage(
-        "Wallet not found: Please install or enable a Stellar wallet such as Freighter."
-      );
-    }
-
-    if (type === "reject") {
-      setErrorMessage(
-        "User rejected transaction: You cancelled the wallet approval request."
-      );
-    }
-
-    if (type === "balance") {
-      setErrorMessage(
-        "Insufficient balance or transaction failed: Please fund your Stellar testnet wallet and try again."
-      );
-    }
-
-    setTxStatus("failed");
-  }
-
-  const txStatusText = {
-    idle: "Ready",
-    pending: "Pending",
-    success: "Success",
-    failed: "Failed",
-  }[txStatus];
 
   return (
     <main className="app-shell">
-      <div className="background-orb orb-one" />
-      <div className="background-orb orb-two" />
-
-      <header className="topbar">
-        <div className="brand">
-          <div className="brand-mark">bs</div>
-          <div>
-            <strong>biodiversity_seed</strong>
-            <span>Seed-bank ledger on Stellar Testnet</span>
-          </div>
+      <nav className="topbar">
+        <div>
+          <p className="eyebrow">Stellar Soroban Level 4 MVP</p>
+          <h1>Biodiversity Seed Passport</h1>
         </div>
 
-        <div className="topbar-actions">
-          <span className="network-chip">Stellar Testnet</span>
-          <a
-            className="ghost-link"
-            href={STELLAR_EXPERT_CONTRACT_URL}
-            target="_blank"
-            rel="noreferrer"
-          >
-            Explorer
-          </a>
-        </div>
-      </header>
-
-      <section className="hero">
-        <div className="hero-main">
-          <p className="eyebrow">Stellar Level 2 Submission</p>
-          <h1>Traceable seed-bank operations, verified on-chain.</h1>
-          <p className="hero-text">
-            Register seed lots, track checkouts, returns, and depletions through
-            a deployed Soroban smart contract. Built for community seed-banks,
-            research teams, and biodiversity preservation workflows.
-          </p>
-        </div>
-
-        <aside className="contract-card">
-          <div className="card-kicker">Deployed contract</div>
-          <code title={CONTRACT_ID}>{CONTRACT_ID}</code>
-          <div className="contract-meta">
-            <span>RPC</span>
-            <strong>Soroban Testnet</strong>
-          </div>
-          <div className="contract-meta">
-            <span>Status</span>
-            <strong>Live</strong>
-          </div>
-          <a
-            className="text-link"
-            href={STELLAR_EXPERT_CONTRACT_URL}
-            target="_blank"
-            rel="noreferrer"
-          >
-            View contract on Stellar Expert →
-          </a>
-        </aside>
-      </section>
-
-      <section className="metrics-grid">
-        <div className="metric-card">
-          <span>Contract functions</span>
-          <strong>7</strong>
-          <p>register, checkout, return, deplete, read and sync</p>
-        </div>
-
-        <div className="metric-card">
-          <span>Wallet status</span>
-          <strong>{publicKey ? "Connected" : "Not connected"}</strong>
-          <p>{publicKey ? shortenText(publicKey, 12, 8) : "Connect wallet to start"}</p>
-        </div>
-
-        <div className="metric-card">
-          <span>Transaction status</span>
-          <strong>{txStatusText}</strong>
-          <p>{txHash ? shortenText(txHash, 14, 10) : "No transaction submitted yet"}</p>
-        </div>
-
-        <div className="metric-card">
-          <span>Activity events</span>
-          <strong>{activityFeed.length}</strong>
-          <p>Local activity feed for demo synchronization</p>
-        </div>
-      </section>
-
-      <section id="operations" className="workspace-grid">
-        <div className="panel wallet-panel">
-          <div className="panel-header">
-            <div>
-              <span className="section-number">01</span>
-              <h2>Wallet Control</h2>
-            </div>
-            <p>Open the multi-wallet modal, then connect your Stellar wallet.</p>
-          </div>
-
-          <div className="button-row">
-            <button onClick={connectWallet}>Connect Wallet</button>
-            <button className="secondary-button" onClick={refreshWalletAddress}>
-              Refresh Address
-            </button>
+        <div className="wallet-card">
+          <span>{shortenAddress(wallet.publicKey)}</span>
+          {wallet.connected ? (
             <button className="secondary-button" onClick={disconnectWallet}>
               Disconnect
             </button>
-          </div>
+          ) : (
+            <button className="primary-button" onClick={connectWallet}>
+              Connect wallet
+            </button>
+          )}
+        </div>
+      </nav>
 
-          <div className="data-row">
-            <span>Connected wallet</span>
-            <code title={publicKey || "Not connected yet"}>
-              {publicKey ? shortenText(publicKey, 12, 8) : "Not connected yet"}
-            </code>
+      <section className="hero-grid">
+        <div className="hero-card">
+          <p className="eyebrow">Production-ready seed-bank provenance</p>
+          <h2>Track seed lots, custody history, viability, and distribution on Stellar.</h2>
+          <p>
+            This MVP helps seed banks, researchers, and conservation programs create a
+            transparent audit trail for biodiversity seed collections using Soroban
+            smart contracts on Stellar Testnet.
+          </p>
+
+          <div className="hero-actions">
+            <button className="primary-button" onClick={refreshProductData}>
+              Refresh product data
+            </button>
+            <a className="link-button" href={getContractExplorerUrl()} target="_blank">
+              Open explorer
+            </a>
           </div>
         </div>
 
-        <div className="panel">
-          <div className="panel-header">
+        <div className="contract-card">
+          <p className="eyebrow">Contract runtime</p>
+          <dl>
             <div>
-              <span className="section-number">02</span>
-              <h2>Register Seed Lot</h2>
+              <dt>Network</dt>
+              <dd>{CONTRACT_CONFIG.network}</dd>
             </div>
-            <p>Create a verifiable on-chain record for a seed lot.</p>
-          </div>
-
-          <label>Species</label>
-          <input value={species} onChange={(e) => setSpecies(e.target.value)} />
-
-          <label>Origin</label>
-          <input value={origin} onChange={(e) => setOrigin(e.target.value)} />
-
-          <label>Seed count</label>
-          <input value={count} onChange={(e) => setCount(e.target.value)} />
-
-          <button onClick={registerLot}>Register seed lot</button>
-        </div>
-
-        <div className="panel">
-          <div className="panel-header">
             <div>
-              <span className="section-number">03</span>
-              <h2>Seed Movements</h2>
+              <dt>Contract ID</dt>
+              <dd>{CONTRACT_CONFIG.contractId}</dd>
             </div>
-            <p>Record checkout, return, or depletion against a seed lot.</p>
-          </div>
-
-          <label>Lot ID</label>
-          <input value={lotId} onChange={(e) => setLotId(e.target.value)} />
-
-          <label>Amount</label>
-          <input value={amount} onChange={(e) => setAmount(e.target.value)} />
-
-          <label>Study / note / reason</label>
-          <input value={note} onChange={(e) => setNote(e.target.value)} />
-
-          <div className="button-row">
-            <button onClick={checkoutSeeds}>Checkout</button>
-            <button onClick={returnSeeds}>Return</button>
-            <button onClick={depleteSeeds}>Deplete</button>
-          </div>
-        </div>
-
-        <div className="panel state-panel">
-          <div className="panel-header">
             <div>
-              <span className="section-number">04</span>
-              <h2>Contract State</h2>
+              <dt>RPC</dt>
+              <dd>{CONTRACT_CONFIG.rpcUrl}</dd>
             </div>
-            <p>Read seed lot data directly from the deployed contract.</p>
-          </div>
-
-          <button onClick={readLot}>Read lot data</button>
-
-          <pre>{readResult || "No data loaded yet. Register a seed lot, then read Lot ID 1."}</pre>
+          </dl>
         </div>
       </section>
 
-      <section id="evidence" className="evidence-grid">
-        <div className="panel tx-panel">
-          <div className="panel-header">
+      <section className="metrics-grid">
+        <article>
+          <span>Total lots</span>
+          <strong>{stats.totalLots}</strong>
+        </article>
+        <article>
+          <span>Available samples</span>
+          <strong>{stats.availableSamples.toLocaleString()}</strong>
+        </article>
+        <article>
+          <span>Custody records</span>
+          <strong>{stats.custodyRecords}</strong>
+        </article>
+        <article>
+          <span>Risk lots</span>
+          <strong>{stats.riskLots}</strong>
+        </article>
+      </section>
+
+      <section className="content-grid">
+        <article className="panel">
+          <div className="panel-heading">
             <div>
-              <span className="section-number">05</span>
-              <h2>Transaction Monitor</h2>
+              <p className="eyebrow">Contract actions</p>
+              <h3>Function coverage</h3>
             </div>
-            <p>Required Level 2 evidence: pending, success/fail status and tx hash.</p>
+            <span className="pill">{CONTRACT_FUNCTIONS.length} functions</span>
           </div>
 
-          <div className={`status-pill ${txStatus}`}>
-            <span className="status-dot" />
-            {txStatusText}
+          <label className="field-label" htmlFor="action">
+            Select write action
+          </label>
+          <select
+            id="action"
+            value={selectedAction}
+            onChange={(event) =>
+              setSelectedAction(event.target.value as ContractFunctionName)
+            }
+          >
+            {writeFunctions.map((item) => (
+              <option key={item.name} value={item.name}>
+                {item.label}
+              </option>
+            ))}
+          </select>
+
+          <button className="primary-button full-width" onClick={runAction}>
+            Run selected action
+          </button>
+
+          <div className={`status-box ${status.type}`}>
+            <strong>{status.type.toUpperCase()}</strong>
+            <p>{status.message}</p>
+            {status.txHash ? <code>{status.txHash}</code> : null}
           </div>
 
-          <div className="data-row">
-            <span>Transaction hash</span>
-            <code title={txHash || "No transaction yet"}>
-              {txHash ? txHash : "No transaction yet"}
-            </code>
-          </div>
-
-          {txHash && (
-            <a
-              className="text-link"
-              href={`https://stellar.expert/explorer/testnet/tx/${txHash}`}
-              target="_blank"
-              rel="noreferrer"
-            >
-              View transaction on Stellar Expert →
-            </a>
-          )}
-
-          {errorMessage && <div className="error-box">{errorMessage}</div>}
-        </div>
-
-        <div className="panel activity-panel">
-          <div className="panel-header">
-            <div>
-              <span className="section-number">06</span>
-              <h2>Activity Feed</h2>
-            </div>
-            <p>Local event-style feed showing recent app and contract actions.</p>
-          </div>
-
-          {activityFeed.length === 0 && (
-            <div className="empty-state">
-              No activity yet. Start by connecting wallet or registering a seed lot.
-            </div>
-          )}
-
-          {activityFeed.map((item, index) => (
-            <div className="activity-item" key={`${item.title}-${index}`}>
-              <div className="activity-marker" />
-              <div>
-                <strong>{item.title}</strong>
-                <p>{item.description}</p>
-                {item.txHash && <code title={item.txHash}>{shortenText(item.txHash, 16, 12)}</code>}
+          <div className="function-list">
+            {[...writeFunctions, ...readFunctions].map((item) => (
+              <div key={item.name} className="function-row">
+                <div>
+                  <strong>{item.name}</strong>
+                  <p>{item.description}</p>
+                </div>
+                <span>{item.type}</span>
               </div>
-            </div>
-          ))}
-        </div>
+            ))}
+          </div>
+        </article>
 
-        <div className="panel error-panel">
-          <div className="panel-header">
+        <article className="panel">
+          <div className="panel-heading">
             <div>
-              <span className="section-number">07</span>
-              <h2>Handled Errors</h2>
+              <p className="eyebrow">Seed lots</p>
+              <h3>Registry dashboard</h3>
             </div>
-            <p>Three required Level 2 error types are demonstrated here.</p>
+            <span className="pill">mobile ready</span>
           </div>
 
-          <div className="error-demo-grid">
-            <button className="secondary-button" onClick={() => showHandledError("wallet")}>
-              Wallet not found
-            </button>
-            <button className="secondary-button" onClick={() => showHandledError("reject")}>
-              User rejected
-            </button>
-            <button className="secondary-button" onClick={() => showHandledError("balance")}>
-              Insufficient balance
+          <div className="seed-list">
+            {MOCK_SEED_LOTS.map((lot) => (
+              <div className="seed-card" key={lot.lotId}>
+                <div>
+                  <strong>{lot.accessionCode}</strong>
+                  <p>{lot.species}</p>
+                </div>
+                <span className={`status-pill ${lot.status.toLowerCase().replaceAll(" ", "-")}`}>
+                  {lot.status}
+                </span>
+                <dl>
+                  <div>
+                    <dt>Origin</dt>
+                    <dd>{lot.origin}</dd>
+                  </div>
+                  <div>
+                    <dt>Available</dt>
+                    <dd>{lot.availableSamples} / {lot.totalSamples}</dd>
+                  </div>
+                  <div>
+                    <dt>Viability</dt>
+                    <dd>{lot.viabilityScore}%</dd>
+                  </div>
+                </dl>
+              </div>
+            ))}
+          </div>
+        </article>
+      </section>
+
+      <section className="content-grid">
+        <article className="panel">
+          <div className="panel-heading">
+            <div>
+              <p className="eyebrow">User onboarding</p>
+              <h3>Wallet interaction proof</h3>
+            </div>
+            <span className="pill">{interactions.length} records</span>
+          </div>
+
+          <div className="activity-list">
+            {interactions.length === 0 ? (
+              <p className="muted">Refresh data or run a contract action to populate interactions.</p>
+            ) : (
+              interactions.map((item) => (
+                <div className="activity-row" key={item.id}>
+                  <div>
+                    <strong>{item.action}</strong>
+                    <p>{item.wallet} · {item.timestamp}</p>
+                  </div>
+                  <span>{item.status}</span>
+                </div>
+              ))
+            )}
+          </div>
+        </article>
+
+        <article className="panel">
+          <div className="panel-heading">
+            <div>
+              <p className="eyebrow">Product validation</p>
+              <h3>User feedback</h3>
+            </div>
+            <span className="pill">{feedback.length} feedback</span>
+          </div>
+
+          <div className="feedback-form">
+            <label className="field-label" htmlFor="role">User role</label>
+            <select
+              id="role"
+              value={feedbackRole}
+              onChange={(event) => setFeedbackRole(event.target.value)}
+            >
+              <option>Seed bank operator</option>
+              <option>Researcher</option>
+              <option>Conservation NGO</option>
+              <option>Community seed bank</option>
+            </select>
+
+            <label className="field-label" htmlFor="score">Score: {feedbackScore}/5</label>
+            <input
+              id="score"
+              type="range"
+              min="1"
+              max="5"
+              value={feedbackScore}
+              onChange={(event) => setFeedbackScore(Number(event.target.value))}
+            />
+
+            <label className="field-label" htmlFor="comment">Feedback</label>
+            <textarea
+              id="comment"
+              value={feedbackComment}
+              onChange={(event) => setFeedbackComment(event.target.value)}
+              placeholder="Example: the custody flow is clear for our seed bank team..."
+            />
+
+            <button className="primary-button full-width" onClick={sendFeedback}>
+              Save feedback
             </button>
           </div>
-        </div>
+        </article>
+      </section>
+
+      <section className="content-grid">
+        <article className="panel">
+          <div className="panel-heading">
+            <div>
+              <p className="eyebrow">Monitoring</p>
+              <h3>Analytics summary</h3>
+            </div>
+            <span className="pill">local telemetry</span>
+          </div>
+
+          <div className="metrics-grid compact">
+            <article>
+              <span>Events</span>
+              <strong>{analyticsSummary.trackedEvents}</strong>
+            </article>
+            <article>
+              <span>Wallet</span>
+              <strong>{analyticsSummary.walletInteractions}</strong>
+            </article>
+            <article>
+              <span>Contract</span>
+              <strong>{analyticsSummary.contractActions}</strong>
+            </article>
+          </div>
+        </article>
+
+        <article className="panel">
+          <div className="panel-heading">
+            <div>
+              <p className="eyebrow">Activity</p>
+              <h3>Analytics events</h3>
+            </div>
+          </div>
+
+          <div className="activity-list">
+            {analyticsEvents.length === 0 ? (
+              <p className="muted">No analytics events yet.</p>
+            ) : (
+              analyticsEvents.slice(0, 5).map((event) => (
+                <div className="activity-row" key={`${event.name}-${event.timestamp}`}>
+                  <div>
+                    <strong>{event.name}</strong>
+                    <p>{event.timestamp}</p>
+                  </div>
+                </div>
+              ))
+            )}
+          </div>
+        </article>
       </section>
     </main>
   );
 }
 
+export default App;
