@@ -1,26 +1,52 @@
-# Rust build output
+﻿# Rust / Soroban build output
 target/
+**/target/
 
-# Stellar local data / identities
-.stellar/
-
-# Node / frontend
+# Node dependencies
 node_modules/
+frontend/node_modules/
+server/node_modules/
+
+# Frontend build output
 dist/
+frontend/dist/
+frontend/.vite/
 .vite/
+
+# Backend build output
+server/dist/
 
 # Environment files
 .env
-.env.local
-.env.*.local
+.env.*
+!.env.example
+frontend/.env
+frontend/.env.*
+server/.env
+server/.env.*
 
-# Deploy logs / temp
+# Stellar local data / identities
+.stellar/
+stellar.toml.local
+
+# Deploy temporary logs
 deploy-output.txt
+deploy-stdout.tmp
+deploy-stderr.tmp
 
-# OS files
+# Local verification logs
+version-check.txt
+*.log
+
+# OS / editor files
 .DS_Store
 Thumbs.db
-
-# Editor
 .vscode/
 .idea/
+
+# Backup files
+*.bak
+*.tmp
+
+# Soroban test snapshots generated locally
+contracts/**/test_snapshots/
