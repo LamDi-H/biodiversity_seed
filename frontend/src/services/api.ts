@@ -1,4 +1,4 @@
-﻿import { CONTRACT_FUNCTIONS, MOCK_STATS, type RegistryStatsView } from "./contract";
+import { CONTRACT_FUNCTIONS, DEFAULT_STATS, type RegistryStatsView } from "./contract";
 
 export type InteractionRecord = {
   id: string;
@@ -17,20 +17,78 @@ export type FeedbackRecord = {
   timestamp: string;
 };
 
-const API_BASE_URL = import.meta.env.VITE_API_BASE_URL ?? "http://localhost:8787";
+const API_BASE_URL = import.meta.env.VITE_API_BASE_URL ?? "";
+
+function apiUrl(path: string): string {
+  if (!API_BASE_URL) {
+    return "";
+  }
+
+  return `${API_BASE_URL}${path}`;
+}
+
+function isRegistryStatsView(value: unknown): value is RegistryStatsView {
+  if (!value || typeof value !== "object") {
+    return false;
+  }
+
+  const candidate = value as Partial<RegistryStatsView>;
+
+  return (
+    typeof candidate.totalLots === "number" &&
+    typeof candidate.activeLots === "number" &&
+    typeof candidate.distributedLots === "number" &&
+    typeof candidate.riskLots === "number" &&
+    typeof candidate.totalSamples === "number" &&
+    typeof candidate.availableSamples === "number" &&
+    typeof candidate.custodyRecords === "number"
+  );
+}
+
+function isInteractionRecord(value: unknown): value is InteractionRecord {
+  if (!value || typeof value !== "object") {
+    return false;
+  }
+
+  const candidate = value as Partial<InteractionRecord>;
+
+  return (
+    typeof candidate.id === "string" &&
+    typeof candidate.wallet === "string" &&
+    typeof candidate.action === "string" &&
+    typeof candidate.status === "string" &&
+    typeof candidate.timestamp === "string" &&
+    typeof candidate.txHash === "string"
+  );
+}
 
 export async function fetchRegistryStats(): Promise<RegistryStatsView> {
+  const url = apiUrl("/api/analytics");
+
+  if (!url) {
+    return DEFAULT_STATS;
+  }
+
   try {
-    const response = await fetch(`${API_BASE_URL}/api/config`);
+    const response = await fetch(url);
 
     if (!response.ok) {
-      return MOCK_STATS;
+      return DEFAULT_STATS;
     }
 
-    await response.json();
-    return MOCK_STATS;
+    const payload = await response.json();
+
+    if (isRegistryStatsView(payload)) {
+      return payload;
+    }
+
+    if (isRegistryStatsView(payload.registryStats)) {
+      return payload.registryStats;
+    }
+
+    return DEFAULT_STATS;
   } catch {
-    return MOCK_STATS;
+    return DEFAULT_STATS;
   }
 }
 
@@ -39,38 +97,56 @@ export async function fetchFunctionCoverage() {
 }
 
 export async function fetchRecentInteractions(): Promise<InteractionRecord[]> {
-  return [
-    {
-      id: "interaction-001",
-      wallet: "GCL4...SEED",
-      action: "create_seed_lot",
-      status: "success",
-      timestamp: "2 minutes ago",
-      txHash: "mock-create-seed-lot"
-    },
-    {
-      id: "interaction-002",
-      wallet: "GBIO...BANK",
-      action: "reserve_samples",
-      status: "success",
-      timestamp: "18 minutes ago",
-      txHash: "mock-reserve-samples"
-    },
-    {
-      id: "interaction-003",
-      wallet: "GCON...LABS",
-      action: "record_viability",
-      status: "pending",
-      timestamp: "32 minutes ago",
-      txHash: "mock-record-viability"
+  const url = apiUrl("/api/interactions");
+
+  if (!url) {
+    return [];
+  }
+
+  try {
+    const response = await fetch(url);
+
+    if (!response.ok) {
+      return [];
     }
-  ];
+
+    const payload = await response.json();
+    const records = Array.isArray(payload) ? payload : payload.interactions;
+
+    if (!Array.isArray(records)) {
+      return [];
+    }
+
+    return records.filter(isInteractionRecord);
+  } catch {
+    return [];
+  }
 }
 
 export async function submitFeedback(record: Omit<FeedbackRecord, "id" | "timestamp">) {
-  return {
+  const savedRecord: FeedbackRecord = {
     ...record,
     id: `feedback-${Date.now()}`,
     timestamp: new Date().toISOString()
   };
+
+  const url = apiUrl("/api/feedback");
+
+  if (!url) {
+    return savedRecord;
+  }
+
+  try {
+    await fetch(url, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify(savedRecord)
+    });
+  } catch {
+    return savedRecord;
+  }
+
+  return savedRecord;
 }
